@@ -19,9 +19,10 @@
     along with Nfstrace.  If not, see <http://www.gnu.org/licenses/>.
 */
 //------------------------------------------------------------------------------
+#include <signal.h>
+#include <arpa/inet.h> // inet_ntop
 #include "filtration/pcap/capture_reader.h"
-#include "filtration/pcap/bpf.h"
-#include "filtration/pcap/pcap_error.h"
+
 //------------------------------------------------------------------------------
 namespace NST
 {
@@ -29,89 +30,323 @@ namespace filtration
 {
 namespace pcap
 {
-CaptureReader::CaptureReader(const Params& params)
-    : BaseReader{params.interface}
+
+// 4194304 bytes
+constexpr static unsigned int blocksiz = 1 << 22;
+// 2048 bytes
+constexpr static unsigned int framesiz = 1 << 11;
+constexpr static unsigned int blocknum = 64;
+
+struct block_desc 
 {
-    char        errbuf[PCAP_ERRBUF_SIZE]; // storage of error description
-    const char* device{source.c_str()};
-    handle = pcap_create(device, errbuf);
-    if(!handle)
+    uint32_t version;
+    uint32_t offset_to_priv;
+    struct tpacket_hdr_v1 h1;
+};
+
+struct pfring_pkthdr {
+    /* pcap header */
+    struct timeval ts; /* time stamp */
+    u_int32_t caplen; /* length of portion present */
+    u_int32_t len; /* length of whole packet (off wire) */
+};
+
+PacketRing::PacketRing(const std::string& interface, const std::string& filter):
+    filter{filter},
+    loop_stopped{false} 
+{
+    memset(&ring, 0, sizeof(ring));
+    //A socket selects a group by
+    //encoding the ID in the first 16 bits of the integer option value.
+    int fanout_group_id = getpid() & 0xffff;
+    setup_socket(interface, fanout_group_id);
+}
+
+PacketRing::~PacketRing() 
+{
+    close(packet_socket);
+    munmap(ring.mapped_buffer, ring.req.tp_block_size * ring.req.tp_block_nr);
+    free(ring.rd);
+}
+
+CaptureReader::CaptureReader(const Params& params)
+        : BaseReader{params.interface},
+            packet_ring{params.interface, params.filter} 
+{
+    this->handle = packet_ring.get_handle();
+}
+
+void PacketRing::walk_block(struct block_desc *pbd/*, const int block_num*/) 
+{
+    int num_pkts = pbd->h1.num_pkts, i;
+    unsigned long bytes = 0;
+    struct tpacket3_hdr *ppd;
+
+    ppd = (struct tpacket3_hdr *) ((uint8_t *) pbd + pbd->h1.offset_to_first_pkt);
+    for (i = 0; i < num_pkts; ++i) 
     {
-        throw PcapError("pcap_create", errbuf);
+        bytes += ppd->tp_snaplen;
+
+        struct pfring_pkthdr packet_header;
+        memset(&packet_header, 0, sizeof(packet_header));
+        packet_header.len = ppd->tp_snaplen;
+        packet_header.caplen = ppd->tp_snaplen;
+
+        //u_int8_t timestamp = 0;
+        //u_int8_t add_hash = 0;
+
+        u_char* data_pointer = (u_char*)((uint8_t *) ppd + ppd->tp_mac);
+
+        //parse_pkt(data_pointer, &packet_header, 4, timestamp, add_hash);
+
+        pcap_pkthdr pkthdr;
+        pkthdr.caplen = packet_header.caplen;
+        pkthdr.len = packet_header.len;
+        pkthdr.ts = packet_header.ts;
+
+        this->callback(this->user, &pkthdr, data_pointer);
+
+        ppd = (struct tpacket3_hdr *) ((uint8_t *) ppd + ppd->tp_next_offset);
     }
 
-    if(int status{pcap_set_snaplen(handle, params.snaplen)})
+    received_packets += num_pkts;
+    received_bytes += bytes;
+}
+
+// Get interface number by name
+static int get_interface_number_by_device_name(int socket_fd, std::string interface_name){
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+
+    if (interface_name.size() > IFNAMSIZ) 
     {
-        throw PcapError("pcap_set_snaplen", pcap_statustostr(status));
+        return -1;
     }
 
-    if(int status{pcap_set_promisc(handle, params.promisc ? 1 : 0)})
+    strncpy(ifr.ifr_name, interface_name.c_str(), sizeof(ifr.ifr_name));
+
+    // get interface index
+    if (ioctl(socket_fd, SIOCGIFINDEX, &ifr) == -1) 
     {
-        throw PcapError("pcap_set_promisc", pcap_statustostr(status));
+        return -1;
     }
 
-    if(int status{pcap_set_timeout(handle, params.timeout_ms)})
+    return ifr.ifr_ifindex;
+}
+
+static void flush_block(struct block_desc *pbd) 
+{
+    pbd->h1.block_status = TP_STATUS_KERNEL;
+}
+
+int PacketRing::setup_socket(const std::string& interface_name, int fanout_group_id) 
+{
+
+    // creation of the capture socket
+    this->packet_socket = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+
+    char ebuf[PCAP_ERRBUF_SIZE];
+    if (this->packet_socket == -1) 
     {
-        throw PcapError("pcap_set_timeout", pcap_statustostr(status));
+        throw std::runtime_error("Can't create AF_PACKET socket");
     }
 
-    if(int status{pcap_set_buffer_size(handle, params.buffer_size)})
+    const char* device = interface_name.c_str();
+    handle = pcap_create(device, ebuf);
+    if(handle == NULL) 
     {
-        throw PcapError("pcap_set_buffer_size", pcap_statustostr(status));
+        throw PcapError("pcap_create", ebuf);
+    }
+    bpf_u_int32 localnet, netmask = 0;
+    if (pcap_lookupnet(device, &localnet, &netmask, ebuf) < 0) 
+    {
+        throw PcapError("pcap_lookupnet", ebuf);
     }
 
-    if(int status{pcap_activate(handle)})
+    int status = pcap_activate(handle);
+    if(status < 0) 
     {
-        throw PcapError("pcap_activate", pcap_statustostr(status));
+        throw PcapError("pcap_activate", ebuf);
     }
 
-    pcap_direction_t direction{PCAP_D_INOUT};
-    switch(params.direction)
+    BPF bpf(handle, filter.c_str(), netmask);
+    bpf_program* bpf_prg = bpf;
+    struct sock_fprog filter = { (unsigned short) bpf_prg->bf_len, (struct sock_filter *) bpf_prg->bf_insns };
+    int version = TPACKET_V3;
+    int setsockopt_packet_version = setsockopt(this->packet_socket, SOL_PACKET, PACKET_VERSION, &version, sizeof(version));
+    if (setsockopt_packet_version < 0) 
     {
-        using Direction = CaptureReader::Direction;
-    case Direction::IN:
-        direction = PCAP_D_IN;
-        break;
-    case Direction::OUT:
-        direction = PCAP_D_OUT;
-        break;
-    case Direction::INOUT:
-        direction = PCAP_D_INOUT;
-        break;
+        throw std::runtime_error("setsockopt version");
     }
-    if(int status{pcap_setdirection(handle, direction)})
+    setsockopt_packet_version = setsockopt(this->packet_socket, SOL_SOCKET, SO_ATTACH_FILTER, &filter, sizeof(filter));
+    if (setsockopt_packet_version < 0) 
     {
-        throw PcapError("pcap_setdirection", pcap_statustostr(status));
+        throw std::runtime_error("Can't set BPF filter");
     }
 
-    bpf_u_int32 localnet, netmask;
-    if(pcap_lookupnet(device, &localnet, &netmask, errbuf) < 0)
+    int interface_number = get_interface_number_by_device_name(this->packet_socket, interface_name);
+
+    if (interface_number == -1) 
     {
-        throw PcapError("pcap_lookupnet", errbuf);
+        throw std::runtime_error("Can't get interface number by interface name");
     }
 
-    BPF bpf(handle, params.filter.c_str(), netmask);
+    // Switch to PROMISC mode
+    struct packet_mreq sock_params;
+    memset(&sock_params, 0, sizeof(sock_params));
+    sock_params.mr_type = PACKET_MR_PROMISC;
+    sock_params.mr_ifindex = interface_number;
 
-    if(pcap_setfilter(handle, bpf) < 0)
+    int set_promisc = setsockopt(this->packet_socket, SOL_PACKET, PACKET_ADD_MEMBERSHIP, (void *)&sock_params, sizeof(sock_params));
+
+    if (set_promisc == -1) 
     {
-        throw PcapError("pcap_setfiltration", pcap_geterr(handle));
+        throw std::runtime_error("Can't enable promisc mode");
+    }
+
+    struct sockaddr_ll bind_address;
+    memset(&bind_address, 0, sizeof(bind_address));
+
+    // fill sockaddr_ll struct to prepare binding
+    bind_address.sll_family = AF_PACKET;
+    bind_address.sll_protocol = htons(ETH_P_ALL);
+    bind_address.sll_ifindex = interface_number;
+
+    memset(&ring.req, 0, sizeof(ring.req));
+
+    ring.req.tp_block_size = blocksiz;/* Minimal size of contiguous block */
+    ring.req.tp_frame_size = framesiz; /* Number of blocks */
+    ring.req.tp_block_nr = blocknum;/* Size of frame */
+    ring.req.tp_frame_nr = (blocksiz * blocknum) / framesiz;/* Total number of frames */
+
+    ring.req.tp_retire_blk_tov = 60; // Timeout in msec
+    ring.req.tp_feature_req_word = TP_FT_REQ_FILL_RXHASH;
+
+    // allocation of the circular buffer (ring)
+    int setsockopt_rx_ring = setsockopt(packet_socket, SOL_PACKET , PACKET_RX_RING , (void*)&ring.req , sizeof(ring.req));
+
+    if (setsockopt_rx_ring == -1) 
+    {
+        throw std::runtime_error("Can't enable RX_RING for AF_PACKET socket");
+    }
+
+    // mapping of the allocated buffer to the user process
+    ring.mapped_buffer = (uint8_t*)mmap(NULL, ring.req.tp_block_size * ring.req.tp_block_nr, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_LOCKED, packet_socket, 0);
+
+    if (ring.mapped_buffer == MAP_FAILED) 
+    {
+        throw std::runtime_error("mmap failed!");
+    }
+
+    // Allocate iov structure for each block
+    ring.rd = (struct iovec*)malloc(ring.req.tp_block_nr * sizeof(struct iovec));
+
+    // Initilize iov structures
+    for (unsigned int i = 0; i < ring.req.tp_block_nr; ++i) 
+    {
+        ring.rd[i].iov_base = ring.mapped_buffer + (i * ring.req.tp_block_size);
+        ring.rd[i].iov_len = ring.req.tp_block_size;
+    }
+
+    //bind socket to the interface
+    int bind_result = bind(packet_socket, (struct sockaddr *)&bind_address, sizeof(bind_address));
+
+    if (bind_result == -1) 
+    {
+        throw std::runtime_error("Can't bind to AF_PACKET socket");
+    }
+
+    //PACKET_FANOUT is since Linux 3.1
+    //To scale processing across threads
+    if (fanout_group_id) 
+    {
+        // PACKET_FANOUT_LB - round robin
+        // PACKET_FANOUT_CPU - send packets to CPU where packet arrived
+        int fanout_type = PACKET_FANOUT_CPU;
+        int fanout_arg = (fanout_group_id | (fanout_type << 16));
+        int setsockopt_fanout = setsockopt(this->packet_socket, SOL_PACKET, PACKET_FANOUT, &fanout_arg, sizeof(fanout_arg));
+        if (setsockopt_fanout < 0) 
+        {
+            throw std::runtime_error("Can't configure fanout");
+        }
+    }
+
+    return packet_socket;
+}
+
+void PacketRing::start_af_packet_capture(void* user, pcap_handler callback) 
+{
+
+    this->user = (u_char*) user;
+    this->callback = callback;
+
+    unsigned int current_block_num = 0;
+    struct pollfd pfd;
+    memset(&pfd, 0, sizeof(pfd));
+
+    pfd.fd = packet_socket;
+    pfd.events = POLLIN | POLLERR;
+    pfd.revents = 0;
+    sigset_t sigmask;
+    /*  Un-mask all signals while in ppoll() so any signal will cause
+     *  ppoll() to return prematurely. */
+    sigemptyset(&sigmask);
+    const struct timespec timeout = { 1, 0 };
+    while (!loop_stopped) 
+    {
+        struct block_desc *pbd = (struct block_desc *) ring.rd[current_block_num].iov_base;
+
+        if ((pbd->h1.block_status & TP_STATUS_USER) == 0) 
+        {
+            // to wait for incoming packets
+            int res = ppoll(&pfd, 1, &timeout, &sigmask);
+
+            //exit if ppoll returned by a signal
+            if(res == EINTR) 
+            {
+                break;
+            }
+
+            continue;
+        }
+
+        walk_block(pbd/*TODO , current_block_num*/);
+        flush_block(pbd);
+        current_block_num = (current_block_num + 1) % blocknum;
+    }
+    socklen_t len = sizeof(stats);
+    int err = getsockopt(packet_socket, SOL_PACKET, PACKET_STATISTICS, &stats, &len);
+    if(err < 0) 
+    {
+        throw std::runtime_error("getsockopt PACKET_STATISTICS");
     }
 }
 
+void PacketRing::break_loop() 
+{
+    loop_stopped = true;
+}
+
+bool CaptureReader::loop(void* user, pcap_handler callback, int count) 
+{
+    (void)count;
+    packet_ring.start_af_packet_capture(user, callback);
+    return true;
+} 
+
 void CaptureReader::print_statistic(std::ostream& out) const
 {
-    struct pcap_stat stat = {0, 0, 0};
-    if(pcap_stats(handle, &stat) == 0)
-    {
-        out << "Statistics from interface: " << source << '\n'
-            << "  packets received by filtration: " << stat.ps_recv << '\n'
-            << "  packets dropped by kernel     : " << stat.ps_drop << '\n'
-            << "  packets dropped by interface  : " << stat.ps_ifdrop;
-    }
-    else
-    {
-        throw PcapError("pcap_stats", pcap_geterr(handle));
-    }
+    out << "Statistics from interface: " << source << '\n'
+            << "  packets received by filtration: " <<  packet_ring.get_received_packets() << '\n'
+            << "  bytes received by filtration: " << packet_ring.get_received_bytes() << '\n'
+            << "  packets dropped by kernel     : " << packet_ring.packet_stats().tp_drops << '\n';
+//          << "  packets dropped by interface  : " << stat.ps_ifdrop;
+}
+
+
+void CaptureReader::break_loop() 
+{
+    packet_ring.break_loop();
 }
 
 std::ostream& operator<<(std::ostream& out, const CaptureReader::Params& params)

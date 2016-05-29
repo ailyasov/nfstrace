@@ -58,7 +58,7 @@ protected:
     }
 
 public:
-    bool loop(void* user, pcap_handler callback, int count = 0)
+    virtual bool loop(void* user, pcap_handler callback, int count = 0)
     {
         const int err{pcap_loop(handle, count, callback, (u_char*)user)};
         if(err == -1) throw PcapError("pcap_loop", pcap_geterr(handle));
@@ -66,7 +66,7 @@ public:
         return err == 0; // count is exhausted
     }
 
-    inline void               break_loop() { pcap_breakloop(handle); }
+    virtual void              break_loop() { pcap_breakloop(handle); }
     inline pcap_t*&           get_handle() { return handle; }
     inline int                datalink() const { return pcap_datalink(handle); }
     inline static const char* datalink_name(const int dlt) { return pcap_datalink_val_to_name(dlt); }
