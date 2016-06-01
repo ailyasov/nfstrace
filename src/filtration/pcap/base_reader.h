@@ -71,7 +71,7 @@ public:
     inline int                datalink() const { return pcap_datalink(handle); }
     inline static const char* datalink_name(const int dlt) { return pcap_datalink_val_to_name(dlt); }
     inline static const char* datalink_description(const int dlt) { return pcap_datalink_val_to_description(dlt); }
-    virtual void print_statistic(std::ostream& out) const = 0;
+    virtual void print_statistic(std::ostream& out) = 0;
 
 protected:
     pcap_t*           handle;

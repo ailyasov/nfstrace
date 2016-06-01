@@ -23,6 +23,8 @@
 #define CAPTURE_READER_H
 //------------------------------------------------------------------------------
 #include <ostream>
+#include <vector>
+#include <thread>
 
 #include <pcap/pcap.h>
 
@@ -43,6 +45,8 @@
 #include <utils/log.h>
 #include <cstring>
 #include <thread>
+#include <atomic>
+#include <condition_variable>
 
 #include "filtration/pcap/base_reader.h"
 //------------------------------------------------------------------------------
@@ -52,18 +56,17 @@ namespace filtration
 {
 namespace pcap
 {
-
+class CaptureReader;
 class PacketRing {
     public:
-        PacketRing(const std::string&, const std::string&);
+        PacketRing(CaptureReader& reader);
         ~PacketRing();
-        void start_af_packet_capture(void* user, pcap_handler callback);
-        void break_loop();
+        void start_af_packet_capture();
 
         uint64_t get_received_packets() const { return received_packets; }
         uint64_t get_received_bytes() const { return received_bytes; }
         const tpacket_stats_v3& packet_stats() const { return stats; }
-        pcap_t* get_handle() const { return handle; }
+    int packet_socket;
     private:
         struct Ring {
             struct iovec *rd;
@@ -75,20 +78,16 @@ class PacketRing {
 
     int setup_socket(const std::string& interface_name, int fanout_group_id);
     void walk_block(struct block_desc *pbd/*, const int block_num*/);
-    u_char* user;
-    pcap_handler callback;
     uint64_t received_packets;
     uint64_t received_bytes;
-    const std::string& filter;
-    bool loop_stopped;
-    int packet_socket;
     struct tpacket_stats_v3 stats;
-    struct Ring ring; 
-    pcap_t*           handle;
-}; 
+    struct Ring ring;
+    CaptureReader& capture_reader;
+};
 
 class CaptureReader : public BaseReader
 {
+friend class PacketRing;
 public:
     enum class Direction : int
     {
@@ -114,10 +113,24 @@ public:
     CaptureReader(const Params& params);
     ~CaptureReader() = default;
 
-    void print_statistic(std::ostream& out) const override;
+    void print_statistic(std::ostream& out) override;
 
 private:
-    PacketRing packet_ring;
+    void fanout_thread();
+
+    pcap_handler callback;
+    u_char* user;
+    const std::string interface;
+    struct sock_fprog filter;
+    unsigned int num_cpus;
+    bool loop_stopped;
+    std::atomic<unsigned int> total_received_packets;
+    std::atomic<unsigned int> total_received_bytes;
+    std::atomic<unsigned int> total_drops;
+    std::condition_variable cv_threads_completed;
+    bool threads_completed;
+    std::mutex mx;
+    std::unique_ptr<BPF> bpf;
 };
 
 std::ostream& operator<<(std::ostream&, const CaptureReader::Params&);
